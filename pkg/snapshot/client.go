@@ -25,10 +25,15 @@ const (
 	EtcdSnapshotKind     SnapshotKind = "EtcdSnapshot"
 	KeyValueSnapshotKind SnapshotKind = "KeyValueSnapshot"
 
-	RequestStoreKey  = "/vcluster/snapshot/request"
-	DBStoreKey       = "/vcluster/snapshot/db"
-	SkipKeysStoreKey = "/vcluster/snapshot/skipkeys"
+	SnapshotMetadataKey = "/vcluster/snapshot/metadata"
+	RequestStoreKey     = "/vcluster/snapshot/request"
+	DBStoreKey          = "/vcluster/snapshot/db"
+	SkipKeysStoreKey    = "/vcluster/snapshot/skipkeys"
 )
+
+type SnapshotMetadata struct {
+	Kind SnapshotKind `json:"kind"`
+}
 
 type Client struct {
 	Request  *Request
@@ -178,6 +183,10 @@ func (c *Client) writeEtcdSnapshot(ctx context.Context, etcdClient etcd.Client, 
 		}
 	}
 
+	if err := writeSnapshotMetadata(tarWriter, EtcdSnapshotKind); err != nil {
+		return err
+	}
+
 	if c.Request != nil {
 		log.Info("Adding snapshot request to snapshot archive")
 		requestBytes, err := json.Marshal(c.Request)
@@ -191,8 +200,6 @@ func (c *Client) writeEtcdSnapshot(ctx context.Context, etcdClient etcd.Client, 
 		}
 	}
 
-	// The presence of the DBStoreKey dictates the type of the snapshot archive. KeyValue vs EtcdSnapshot.
-	// Snapshot archive structure changes must be reflected in the getSnapshotArchiveKind func.
 	log.Info("Adding etcd snapshot to snapshot archive")
 	if err := writeArchiveFileEntry(tarWriter, DBStoreKey, dbPath); err != nil {
 		return fmt.Errorf("failed to write etcd snapshot to tar archive: %w", err)
@@ -274,6 +281,10 @@ func (c *Client) writeKeyValueSnapshot(ctx context.Context, etcdClient etcd.Clie
 		}
 	}
 
+	if err := writeSnapshotMetadata(tarWriter, KeyValueSnapshotKind); err != nil {
+		return err
+	}
+
 	// write the snapshot request
 	if c.Request != nil {
 		requestBytes, err := json.Marshal(c.Request)
@@ -341,6 +352,21 @@ func (c *Client) addResourceToSkip(kindPlural, namespacedName string) {
 	}
 
 	c.skipKeys[fmt.Sprintf("/registry/%s/%s", kindPlural, namespacedName)] = struct{}{}
+}
+
+func writeSnapshotMetadata(tarWriter *tar.Writer, kind SnapshotKind) error {
+	metadataBytes, err := json.Marshal(SnapshotMetadata{
+		Kind: kind,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal snapshot metadata: %w", err)
+	}
+
+	if err := writeArchiveEntry(tarWriter, []byte(SnapshotMetadataKey), metadataBytes); err != nil {
+		return fmt.Errorf("failed to snapshot metadata: %w", err)
+	}
+
+	return nil
 }
 
 func writeArchiveEntry(tarWriter *tar.Writer, key, value []byte) error {

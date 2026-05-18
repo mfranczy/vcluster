@@ -195,7 +195,20 @@ func (o *RestoreClient) Run(ctx context.Context, vConfig *config.VirtualClusterC
 	}
 	defer os.Remove(snapshotPath)
 
-	archiveKind, err := getSnapshotArchiveKind(snapshotPath)
+	reader, err := os.Open(snapshotPath)
+	if err != nil {
+		return fmt.Errorf("failed to open snapshot file: %w", err)
+	}
+	defer reader.Close()
+
+	gzipReader, err := gzip.NewReader(reader)
+	if err != nil {
+		return fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	defer gzipReader.Close()
+
+	tarReader := tar.NewReader(gzipReader)
+	archiveKind, pendingEntryName, hasPendingEntry, err := readSnapshotPreamble(tarReader)
 	if err != nil {
 		return fmt.Errorf("failed to determine snapshot archive kind: %w", err)
 	}
@@ -205,14 +218,14 @@ func (o *RestoreClient) Run(ctx context.Context, vConfig *config.VirtualClusterC
 			return fmt.Errorf("restore volumes is not supported for etcd snapshots")
 		}
 		if vConfig.BackingStoreType() == vclusterconfig.StoreTypeEmbeddedEtcd {
-			if err := o.restoreEtcdSnapshot(ctx, vConfig, snapshotPath); err != nil {
+			if err := o.restoreEtcdSnapshot(ctx, vConfig, tarReader); err != nil {
 				return fmt.Errorf("failed to restore etcd snapshot: %w", err)
 			}
 		} else {
 			return fmt.Errorf("restore etcd snapshot is not supported for store type %s", vConfig.BackingStoreType())
 		}
 	} else {
-		if err := o.restoreKeyValueSnapshot(ctx, vConfig, snapshotPath); err != nil {
+		if err := o.restoreKeyValueSnapshot(ctx, vConfig, tarReader, pendingEntryName, hasPendingEntry); err != nil {
 			return fmt.Errorf("restore key-value snapshot: %w", err)
 		}
 	}
@@ -227,7 +240,7 @@ func (o *RestoreClient) Run(ctx context.Context, vConfig *config.VirtualClusterC
 //  3. mutate etcd data via embedded-etcd instance:
 //     - remove skipped keys
 //     - reset pods nodeName and status
-func (o *RestoreClient) restoreEtcdSnapshot(ctx context.Context, vConfig *config.VirtualClusterConfig, snapshotPath string) (retErr error) {
+func (o *RestoreClient) restoreEtcdSnapshot(ctx context.Context, vConfig *config.VirtualClusterConfig, tarReader *tar.Reader) (retErr error) {
 	log := klog.FromContext(ctx)
 
 	// dbPath and skipKeysBytes are snapshot data components to be extracted from the snapshot archive
@@ -239,21 +252,7 @@ func (o *RestoreClient) restoreEtcdSnapshot(ctx context.Context, vConfig *config
 	}()
 	var skipKeysBytes []byte
 
-	log.Info("Reading snapshot archive", "snapshotPath", snapshotPath)
-	reader, err := os.Open(snapshotPath)
-	if err != nil {
-		return fmt.Errorf("failed to get backup: %w", err)
-	}
-	defer reader.Close()
-
-	gzipReader, err := gzip.NewReader(reader)
-	if err != nil {
-		return fmt.Errorf("failed to create gzip reader: %w", err)
-	}
-	defer gzipReader.Close()
-
-	tarReader := tar.NewReader(gzipReader)
-
+	log.Info("Reading snapshot archive")
 	for {
 		header, err := tarReader.Next()
 		if err != nil {
@@ -428,27 +427,13 @@ func (o *RestoreClient) postRestoreSnapshotDataMutation(ctx context.Context, vCo
 	return nil
 }
 
-func (o *RestoreClient) restoreKeyValueSnapshot(ctx context.Context, vConfig *config.VirtualClusterConfig, snapshotPath string) (retErr error) {
+func (o *RestoreClient) restoreKeyValueSnapshot(ctx context.Context, vConfig *config.VirtualClusterConfig, tarReader *tar.Reader, pendingEntryName string, hasPendingEntry bool) (retErr error) {
 	// create decoder and encoder
 	decoder := serializer.NewCodecFactory(scheme.Scheme).UniversalDeserializer()
 	encoder := protobuf.NewSerializer(scheme.Scheme, scheme.Scheme)
 
 	// set global vCluster name
 	translate.VClusterName = vConfig.Name
-
-	// now stream objects from object store to etcd
-	reader, err := os.Open(snapshotPath)
-	if err != nil {
-		return fmt.Errorf("failed to get backup: %w", err)
-	}
-	defer reader.Close()
-
-	// optionally decompress
-	gzipReader, err := gzip.NewReader(reader)
-	if err != nil {
-		return fmt.Errorf("failed to create gzip reader: %w", err)
-	}
-	defer gzipReader.Close()
 
 	// create new etcd client that will delete the existing data / recreate the database
 	etcdClient, revertBackup, err := newRestoreEtcdClient(ctx, vConfig)
@@ -467,19 +452,17 @@ func (o *RestoreClient) restoreKeyValueSnapshot(ctx context.Context, vConfig *co
 		}
 	}()
 
-	// create a new tar reader
-	tarReader := tar.NewReader(gzipReader)
-
 	// now restore each key value
 	restoredKeys := 0
 	latestRevision := int64(0)
-	for {
-		// read from archive
-		key, value, err := readArchiveEntry(tarReader)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("read etcd key/value: %w", err)
-		} else if errors.Is(err, io.EOF) || len(key) == 0 {
-			break
+
+	restoreEntry := func(key, value []byte) error {
+		if len(key) == 0 {
+			return nil
+		}
+
+		if string(key) == DBStoreKey {
+			return fmt.Errorf("found native etcd snapshot entry %s in key-value snapshot; snapshot metadata is missing or invalid", DBStoreKey)
 		}
 
 		// transform value if we are restoring to a new vCluster
@@ -487,10 +470,10 @@ func (o *RestoreClient) restoreKeyValueSnapshot(ctx context.Context, vConfig *co
 			// skip mappings
 			splitKey := strings.Split(string(key), "/")
 			if strings.HasPrefix(string(key), store.MappingsPrefix) {
-				continue
+				return nil
 			} else if len(splitKey) == 5 && splitKey[2] == "configmaps" && splitKey[4] == "kube-root-ca.crt" {
 				// we will get separate certificates, so we need to skip these
-				continue
+				return nil
 			}
 		}
 
@@ -502,7 +485,7 @@ func (o *RestoreClient) restoreKeyValueSnapshot(ctx context.Context, vConfig *co
 					return fmt.Errorf("failed to create restore request: %w", err)
 				}
 			}
-			continue
+			return nil
 		}
 
 		// transform pods to make sure they are not deleted on start
@@ -527,10 +510,11 @@ func (o *RestoreClient) restoreKeyValueSnapshot(ctx context.Context, vConfig *co
 		// write the value to etcd
 		if o.skipKey(string(key), vConfig) {
 			klog.Infof("Skip key %s", string(key))
-			continue
+			return nil
 		}
 
 		klog.V(1).Infof("Restore key %s", string(key))
+		var err error
 		latestRevision, err = etcdClient.Put(ctx, string(key), value)
 		if err != nil {
 			return fmt.Errorf("restore etcd key %s: %w", string(key), err)
@@ -540,6 +524,32 @@ func (o *RestoreClient) restoreKeyValueSnapshot(ctx context.Context, vConfig *co
 		restoredKeys++
 		if restoredKeys%100 == 0 {
 			klog.Infof("Restored %d keys", restoredKeys)
+		}
+		return nil
+	}
+
+	if hasPendingEntry {
+		value, err := readArchiveEntryValue(tarReader)
+		if err != nil {
+			return fmt.Errorf("read etcd key/value: %w", err)
+		}
+
+		if err := restoreEntry([]byte(pendingEntryName), value); err != nil {
+			return err
+		}
+	}
+
+	for {
+		// read from archive
+		key, value, err := readArchiveEntry(tarReader)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("read etcd key/value: %w", err)
+		} else if errors.Is(err, io.EOF) || len(key) == 0 {
+			break
+		}
+
+		if err := restoreEntry(key, value); err != nil {
+			return err
 		}
 	}
 
@@ -1111,13 +1121,22 @@ func readArchiveEntry(tarReader *tar.Reader) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 
-	buf := &bytes.Buffer{}
-	_, err = io.Copy(buf, tarReader)
+	value, err := readArchiveEntryValue(tarReader)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return []byte(header.Name), buf.Bytes(), nil
+	return []byte(header.Name), value, nil
+}
+
+func readArchiveEntryValue(tarReader *tar.Reader) ([]byte, error) {
+	buf := &bytes.Buffer{}
+	_, err := io.Copy(buf, tarReader)
+	if err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
 }
 
 func getTranslatedPVCName(pvcName string) string {
@@ -1146,38 +1165,54 @@ func writeTempFile(reader io.Reader) (string, error) {
 	return f.Name(), nil
 }
 
-// getSnapshotArchiveKind analyzes the snapshot file and determines its archive kind (EtcdSnapshotKind or KeyValueSnapshotKind).
-func getSnapshotArchiveKind(fileName string) (SnapshotKind, error) {
-	f, err := os.Open(fileName)
+func readSnapshotPreamble(tarReader *tar.Reader) (SnapshotKind, string, bool, error) {
+	header, err := tarReader.Next()
 	if err != nil {
-		return UnknownSnapshotKind, fmt.Errorf("open file: %w", err)
+		return UnknownSnapshotKind, "", false, fmt.Errorf("failed to read tar header: %w", err)
 	}
-	defer f.Close()
 
-	gzipReader, err := gzip.NewReader(f)
-	if err != nil {
-		return UnknownSnapshotKind, fmt.Errorf("create gzip reader: %w", err)
-	}
-	defer gzipReader.Close()
+	if header.Name == SnapshotReleaseKey {
+		if _, err := readArchiveEntryValue(tarReader); err != nil {
+			return UnknownSnapshotKind, "", false, fmt.Errorf("failed to read snapshot release: %w", err)
+		}
 
-	tarReader := tar.NewReader(gzipReader)
-
-	// look for the etcd snapshot key in the first 50 keys.
-	for range 50 {
-		header, err := tarReader.Next()
+		header, err = tarReader.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				break
+				return KeyValueSnapshotKind, "", false, nil
 			}
-			return UnknownSnapshotKind, fmt.Errorf("failed to read tar header: %w", err)
-		}
-
-		if header.Name == DBStoreKey {
-			return EtcdSnapshotKind, nil
+			return UnknownSnapshotKind, "", false, fmt.Errorf("failed to read tar header: %w", err)
 		}
 	}
 
-	return KeyValueSnapshotKind, nil
+	if header.Name == SnapshotMetadataKey {
+		metadata, err := readSnapshotMetadata(tarReader)
+		if err != nil {
+			return UnknownSnapshotKind, "", false, err
+		}
+		return metadata.Kind, "", false, nil
+	}
+
+	return KeyValueSnapshotKind, header.Name, true, nil
+}
+
+func readSnapshotMetadata(reader io.Reader) (SnapshotMetadata, error) {
+	metadataBytes, err := io.ReadAll(reader)
+	if err != nil {
+		return SnapshotMetadata{}, fmt.Errorf("failed to read snapshot metadata: %w", err)
+	}
+
+	var metadata SnapshotMetadata
+	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+		return SnapshotMetadata{}, fmt.Errorf("failed to unmarshal snapshot metadata: %w", err)
+	}
+
+	switch metadata.Kind {
+	case EtcdSnapshotKind, KeyValueSnapshotKind:
+		return metadata, nil
+	default:
+		return SnapshotMetadata{}, fmt.Errorf("unsupported snapshot kind %q", metadata.Kind)
+	}
 }
 
 func ignoreKeyNotFound(err error) error {
